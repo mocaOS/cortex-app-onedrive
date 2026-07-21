@@ -1,0 +1,411 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listCollections, type CortexCollection } from "../lib/cortex";
+import { surveySelection, type SelectionSurvey } from "../lib/onedrive";
+import {
+  deleteTask,
+  getTask,
+  listTasks,
+  submitTask,
+  taskAction,
+  type TaskDetail,
+  type TaskItem,
+} from "../lib/platform";
+import {
+  buildSyncTask,
+  loadPrefs,
+  savePrefs,
+  SYNC_TASK_NAME,
+  wouldSync,
+  type SyncFolder,
+} from "../lib/syncTask";
+import FolderPicker from "./FolderPicker";
+
+const SCHEDULES: Array<{ label: string; minutes?: number }> = [
+  { label: "manual only" },
+  { label: "every hour", minutes: 60 },
+  { label: "every 6 hours", minutes: 360 },
+  { label: "daily", minutes: 1440 },
+];
+
+const STATUS_CLS: Record<string, string> = {
+  running: "text-[var(--color-accent)]",
+  pending: "text-[var(--color-accent)]",
+  paused: "text-amber-400",
+  completed: "text-emerald-400",
+  failed: "text-red-400",
+  cancelled: "text-[var(--color-muted)]",
+};
+
+const ACTIVE = new Set(["running", "pending"]);
+
+export default function SyncPanel({ clientId }: { clientId: string }) {
+  const [task, setTask] = useState<TaskDetail | null>(null);
+  const [collections, setCollections] = useState<CortexCollection[]>([]);
+  const [folders, setFolders] = useState<SyncFolder[]>([]);
+  const [collectionId, setCollectionId] = useState("");
+  const [scheduleMinutes, setScheduleMinutes] = useState<number | undefined>(undefined);
+  const [docsOnly, setDocsOnly] = useState(true);
+  const [loading, setLoading] = useState<string | null>("loading…");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [survey, setSurvey] = useState<SelectionSurvey | null>(null);
+  const [surveying, setSurveying] = useState(false);
+  const pollRef = useRef<number | null>(null);
+
+  const refresh = useCallback(async (): Promise<TaskDetail | null> => {
+    const tasks = await listTasks();
+    const managed = tasks.find((t) => t.name === SYNC_TASK_NAME);
+    if (!managed) {
+      setTask(null);
+      return null;
+    }
+    const detail = await getTask(managed.task_id);
+    setTask(detail);
+    return detail;
+  }, []);
+
+  // initial load: prefs + collections + existing task
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [prefs, cols] = await Promise.all([
+          loadPrefs(),
+          listCollections().catch(() => [] as CortexCollection[]),
+        ]);
+        if (cancelled) return;
+        setCollections(cols);
+        setFolders(prefs.folders ?? []);
+        setCollectionId(prefs.collectionId ?? "");
+        setScheduleMinutes(prefs.everyMinutes);
+        setDocsOnly(prefs.docsOnly !== false);
+        await refresh();
+        setLoading(null);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refresh]);
+
+  // live projection: how many files the checked folders would sync,
+  // recomputed (debounced) on selection/filter change — mirrors the task's
+  // skip rules (downloadable, size cap, extension filter)
+  useEffect(() => {
+    if (folders.length === 0) {
+      setSurvey(null);
+      setSurveying(false);
+      return;
+    }
+    let cancelled = false;
+    setSurveying(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await surveySelection(
+          clientId,
+          folders.map((f) => f.path),
+          (entry) => wouldSync(entry, docsOnly),
+        );
+        if (!cancelled) setSurvey(result);
+      } catch {
+        if (!cancelled) setSurvey(null);
+      } finally {
+        if (!cancelled) setSurveying(false);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [clientId, folders, docsOnly]);
+
+  // poll while a run is active
+  useEffect(() => {
+    if (!task || !ACTIVE.has(task.status)) return;
+    pollRef.current = window.setTimeout(() => {
+      void refresh().catch(() => undefined);
+    }, 2500);
+    return () => {
+      if (pollRef.current) window.clearTimeout(pollRef.current);
+    };
+  }, [task, refresh]);
+
+  async function withBusy(fn: () => Promise<unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** (Re)submit the managed task with the current settings. Submitting always
+   * starts a run immediately, so this doubles as "sync now". Dropbox lists
+   * recursively and per-folder delta cursors live in app storage, so a
+   * resubmit continues incrementally where the last run left off. */
+  function syncNow() {
+    if (folders.length === 0) {
+      setError("Select at least one folder to sync.");
+      return;
+    }
+    void withBusy(async () => {
+      await savePrefs({
+        folders,
+        collectionId: collectionId || undefined,
+        everyMinutes: scheduleMinutes,
+        docsOnly,
+      });
+      const existing = task;
+      if (existing && ACTIVE.has(existing.status)) return; // already running
+      if (existing) await deleteTask(existing.task_id);
+      await submitTask(
+        buildSyncTask({
+          folders,
+          collectionId: collectionId || undefined,
+          everyMinutes: scheduleMinutes,
+          docsOnly,
+        }),
+      );
+    });
+  }
+
+  function act(action: "pause" | "resume" | "cancel" | "retryFailed") {
+    if (!task) return;
+    void withBusy(() => taskAction(task.task_id, action));
+  }
+
+  if (loading) {
+    return (
+      <p className="font-mono text-xs uppercase tracking-[0.1em] text-[var(--color-faint)]">
+        {loading}
+      </p>
+    );
+  }
+
+  const counts = task?.counts ?? {};
+  const active = task ? ACTIVE.has(task.status) : false;
+  const failedItems: TaskItem[] = (task?.items ?? []).filter((i) => i.status === "failed");
+  const skippedItems: TaskItem[] = (task?.items ?? []).filter((i) => i.status === "skipped");
+
+  return (
+    <div className="space-y-6">
+      <FolderPicker
+        clientId={clientId}
+        selected={folders}
+        onChange={setFolders}
+        disabled={busy || active}
+      />
+
+      {folders.length > 0 && (
+        <p className="font-mono text-xs text-[var(--color-muted)]">
+          {surveying ? (
+            <span className="text-[var(--color-faint)]">
+              projecting sync size…
+            </span>
+          ) : survey ? (
+            <>
+              <span className="text-[var(--color-accent)]">
+                ~{survey.fileCount}
+                {survey.truncated ? "+" : ""} file
+                {survey.fileCount === 1 && !survey.truncated ? "" : "s"}
+              </span>{" "}
+              in {folders.length} folder
+              {folders.length === 1 ? "" : "s"} (incl. sub-folders) will sync
+            </>
+          ) : null}
+        </p>
+      )}
+
+      {/* controls */}
+      <div className="flex flex-wrap items-center gap-3 border border-[var(--color-line)] bg-[var(--color-card)] p-4">
+        <span className="font-mono text-xs uppercase tracking-[0.2em] text-[var(--color-muted)]">
+          Sync
+        </span>
+        <select
+          value={scheduleMinutes ?? ""}
+          onChange={(e) =>
+            setScheduleMinutes(e.target.value ? Number(e.target.value) : undefined)
+          }
+          disabled={busy || active}
+          className="border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 font-mono text-xs outline-none focus:border-[var(--color-accent)]"
+        >
+          {SCHEDULES.map((s) => (
+            <option key={s.label} value={s.minutes ?? ""}>
+              {s.label}
+            </option>
+          ))}
+        </select>
+        {collections.length > 0 && (
+          <select
+            value={collectionId}
+            onChange={(e) => setCollectionId(e.target.value)}
+            disabled={busy || active}
+            className="border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 font-mono text-xs outline-none focus:border-[var(--color-accent)]"
+          >
+            <option value="">default collection</option>
+            {collections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name ?? c.id}
+              </option>
+            ))}
+          </select>
+        )}
+        <label className="flex items-center gap-2 font-mono text-xs text-[var(--color-muted)]">
+          <input
+            type="checkbox"
+            checked={docsOnly}
+            disabled={busy || active}
+            onChange={(e) => setDocsOnly(e.target.checked)}
+            className="accent-[var(--color-accent)]"
+          />
+          documents only
+        </label>
+        <div className="ml-auto flex items-center gap-3">
+          {active ? (
+            <>
+              <button
+                onClick={() => act("pause")}
+                disabled={busy}
+                className="border border-[var(--color-line)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-[0.1em] transition-colors hover:border-amber-400 hover:text-amber-400 disabled:opacity-40"
+              >
+                Pause
+              </button>
+              <button
+                onClick={() => act("cancel")}
+                disabled={busy}
+                className="border border-[var(--color-line)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-[0.1em] text-red-400 transition-colors hover:border-red-400 disabled:opacity-40"
+              >
+                Cancel
+              </button>
+            </>
+          ) : (
+            <>
+              {task?.status === "paused" && (
+                <button
+                  onClick={() => act("resume")}
+                  disabled={busy}
+                  className="border border-[var(--color-line)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-[0.1em] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] disabled:opacity-40"
+                >
+                  Resume
+                </button>
+              )}
+              {(counts.failed ?? 0) > 0 && (
+                <button
+                  onClick={() => act("retryFailed")}
+                  disabled={busy}
+                  className="border border-[var(--color-line)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-[0.1em] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] disabled:opacity-40"
+                >
+                  Retry failed
+                </button>
+              )}
+              <button
+                onClick={syncNow}
+                disabled={busy || folders.length === 0}
+                className="border border-[var(--color-accent)] px-5 py-2 font-mono text-xs font-semibold uppercase tracking-[0.1em] text-[var(--color-accent)] transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-bg)] disabled:opacity-40"
+              >
+                {scheduleMinutes ? "Save schedule & sync" : "Sync now"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* status */}
+      {task && (
+        <div className="border border-[var(--color-line)] bg-[var(--color-card)] p-4">
+          <div className="flex flex-wrap items-baseline gap-x-6 gap-y-2">
+            <span
+              className={`font-mono text-xs font-semibold uppercase tracking-[0.2em] ${
+                STATUS_CLS[task.status] ?? "text-[var(--color-muted)]"
+              }`}
+            >
+              {task.status}
+            </span>
+            <span className="font-mono text-xs text-[var(--color-muted)]">{task.message}</span>
+            {task.schedule?.everyMinutes && (
+              <span className="font-mono text-xs text-[var(--color-faint)]">
+                repeats every{" "}
+                {task.schedule.everyMinutes >= 60
+                  ? `${task.schedule.everyMinutes / 60}h`
+                  : `${task.schedule.everyMinutes}m`}
+              </span>
+            )}
+          </div>
+          <div className="mt-3 flex flex-wrap gap-x-6 gap-y-1 font-mono text-xs">
+            <span className="text-emerald-400">{counts.done ?? 0} synced</span>
+            <span className="text-[var(--color-muted)]">{counts.skipped ?? 0} skipped</span>
+            <span className="text-[var(--color-faint)]">
+              {counts.deduped ?? 0} already in cortex
+            </span>
+            {(counts.failed ?? 0) > 0 && (
+              <span className="text-red-400">{counts.failed} failed</span>
+            )}
+          </div>
+          {task.error && (
+            <p className="mt-3 font-mono text-xs text-red-400">{task.error}</p>
+          )}
+          {task.last_run?.finished_at && !active && (
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--color-faint)]">
+              last run {new Date(task.last_run.finished_at).toLocaleString()}
+            </p>
+          )}
+        </div>
+      )}
+
+      {!task && (
+        <p className="font-mono text-xs text-[var(--color-faint)]">
+          No sync has run yet. Select folders, pick a schedule (or leave it
+          manual) and hit the button — the sync runs inside Cortex and keeps
+          going even if you close this tab. Big drives drain across runs via
+          Graph delta cursors.
+        </p>
+      )}
+
+      {/* problem items */}
+      {(failedItems.length > 0 || skippedItems.length > 0) && (
+        <ul className="max-h-[40vh] space-y-px overflow-y-auto">
+          {failedItems.map((item, i) => (
+            <li
+              key={`f${i}`}
+              className="flex items-baseline gap-4 border border-[var(--color-line)] px-4 py-2.5"
+            >
+              <span className="min-w-0 flex-1 truncate text-sm">
+                {String(item.vars.path ?? item.vars.name ?? "")}
+              </span>
+              <span
+                className="max-w-[40%] shrink-0 truncate text-right font-mono text-[10px] uppercase tracking-[0.1em] text-red-400"
+                title={item.error}
+              >
+                {item.error ?? "failed"}
+              </span>
+            </li>
+          ))}
+          {skippedItems.map((item, i) => (
+            <li
+              key={`s${i}`}
+              className="flex items-baseline gap-4 border border-[var(--color-line)] px-4 py-2.5"
+            >
+              <span className="min-w-0 flex-1 truncate text-sm text-[var(--color-muted)]">
+                {String(item.vars.path ?? item.vars.name ?? "")}
+              </span>
+              <span className="shrink-0 text-right font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--color-faint)]">
+                {item.reason ?? "skipped"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {error && <p className="font-mono text-xs text-red-400">{error}</p>}
+    </div>
+  );
+}

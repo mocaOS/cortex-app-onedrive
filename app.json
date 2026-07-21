@@ -1,0 +1,49 @@
+{
+  "$schema": "./schema/app.v1.json",
+  "id": "onedrive-sync",
+  "name": "OneDrive Sync",
+  "version": "0.1.0",
+  "type": "platform",
+  "description": "Sync selected OneDrive folders into the Cortex knowledge graph — on demand or on a schedule, fully server-side via Microsoft Graph delta",
+  "publisher": {
+    "name": "reneil",
+    "url": "https://github.com/mocaOS"
+  },
+  "icon": "icon.svg",
+  "entry": "index.html",
+  "cortex": {
+    "minVersion": "2.1.0",
+    "keyScope": "read_write",
+    "endpoints": [
+      "upload",
+      "documents",
+      "collections"
+    ],
+    "collections": "all"
+  },
+  "config": [
+    {
+      "name": "ENTRA_CLIENT_ID",
+      "type": "text",
+      "required": true,
+      "description": "Application (client) ID of a Microsoft Entra app registration (free at entra.microsoft.com). Supported account types must include personal Microsoft accounts, and 'Allow public client flows' must be enabled - device-code flow, no client secret needed anywhere."
+    }
+  ],
+  "externalHosts": [
+    "https://graph.microsoft.com"
+  ],
+  "sharing": {
+    "links": false
+  },
+  "users": false,
+  "capabilities": {
+    "http": {
+      "hosts": [
+        "login.microsoftonline.com",
+        "graph.microsoft.com"
+      ]
+    },
+    "tasks": {},
+    "storage": {}
+  }
+}
