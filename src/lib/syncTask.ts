@@ -13,8 +13,9 @@
  *   items    the delta feed, filtered per item: deleted entries, folders,
  *            items outside the selected folders, non-document extensions
  *            (optional) and oversized files are skipped with visible reasons
- *   steps    changed files delete their previous Cortex document
- *            (docmap/{id}), then a binary passthrough upload: Cortex GETs
+ *   steps    binary passthrough upload that REPLACES the file's existing
+ *            Cortex document in place (source_key + replace_document_id
+ *            from docmap/{id} — same id, only changes re-extracted): Cortex GETs
  *            graph /items/{id}/content server-side and follows Graph's one
  *            302 to the pre-authenticated download host (followRedirect —
  *            the target host varies per drive and can't be allowlisted)
@@ -83,12 +84,33 @@ function graphNeedle(path: string): string {
 const DELTA_SELECT =
   "$select=id,name,size,file,folder,parentReference,deleted,eTag";
 
+/** Old backends (no in-place replace) answer an upload without a "replaced"
+ * field and mint a new document — then remove the superseded one, exactly
+ * like the pre-replace delete-then-upload flow did. */
+const REPLACE_FALLBACK_STEPS = [
+  {
+    cortex: { method: "DELETE", path: "documents/{prev.value.docId}" },
+    when: {
+      and: [
+        { notEmpty: "$prev.value.docId" },
+        { eq: ["{up.body.replaced}", ""] },
+        { neq: ["{up.body.document_id}", "{prev.value.docId}"] },
+      ],
+    },
+  },
+];
+
 export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
   const uploadParams = new URLSearchParams({
     start_processing: "true",
     source: "onedrive-sync",
   });
   if (opts.collectionId) uploadParams.set("collection_id", opts.collectionId);
+  // item ids are unique per drive — key on drive id + item id
+  const uploadPath =
+    `upload?${uploadParams.toString()}` +
+    `&source_key=onedrive%3A{vars.driveId|urlencode}%3A{vars.id|urlencode}` +
+    `&replace_document_id={prev.value.docId|urlencode}`;
 
   const auth = { bearer: "$tok.body.access_token" };
   const paginate = { items: "value", next: "@odata.nextLink", maxPages: MAX_PAGES };
@@ -165,6 +187,7 @@ export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
         id: "{item.id}",
         name: "{item.name}",
         path: "{item.parentReference.path}",
+        driveId: "{item.parentReference.driveId}",
         etag: "{item.eTag}",
         size: "{item.size}",
         mime: "{item.file.mimeType}",
@@ -208,23 +231,17 @@ export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
         },
       },
       { id: "prev", store: { get: "docmap/{vars.id}" } },
-      {
-        cortex: { method: "DELETE", path: "documents/{prev.value.docId}" },
-        when: {
-          and: [
-            { found: "$prev.value" },
-            { notEmpty: "$prev.value.docId" },
-            { neq: ["$prev.value.etag", "{vars.etag}"] },
-          ],
-        },
-      },
       // binary passthrough: Graph /content 302s to a pre-authenticated URL
-      // on a variable host — followRedirect handles the one hop server-side
+      // on a variable host — followRedirect handles the one hop server-side.
+      // A changed file REPLACES its Cortex document in place (same id — only
+      // the changed parts are re-extracted): source_key finds it,
+      // replace_document_id adopts documents synced before source keys
+      // existed (empty when new).
       {
         id: "up",
         cortex: {
           method: "POST",
-          path: `upload?${uploadParams.toString()}`,
+          path: uploadPath,
           multipart: {
             fromUrl: "https://graph.microsoft.com/v1.0/me/drive/items/{vars.id}/content",
             auth,
@@ -233,6 +250,10 @@ export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
           },
         },
       },
+      // compatibility: a Cortex backend without in-place replace ignores the
+      // replace params and creates a new document (its response has no
+      // "replaced" field) — delete the previous one as older app versions did
+      ...REPLACE_FALLBACK_STEPS,
       {
         store: {
           put: "docmap/{vars.id}",

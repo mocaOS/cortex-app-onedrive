@@ -56,11 +56,16 @@ platform task, not in your browser.
 - **per file** — Graph has no folder-scoped delta, so the drive-wide feed is
   filtered per item: deleted entries, folders, items outside your selected
   folders, non-document extensions (optional) and files over ~19 MB are
-  skipped with visible reasons. Changed files delete their previous Cortex
-  document (`docmap/{id}`), then a **binary passthrough upload**: Cortex
+  skipped with visible reasons. Then a **binary passthrough upload**: Cortex
   GETs `/items/{id}/content` server-side and follows Graph's one redirect to
   the pre-authenticated download host (variable per drive — the platform
   validates the hop and forwards no credentials to it).
+  Edited files **replace their Cortex document in place**: the upload
+  carries a stable `source_key` (`onedrive:{driveId}:{itemId}`) plus the previous document id
+  (`docmap/{id}`), so the document keeps its id and Cortex re-extracts
+  only the parts that changed. On a Cortex backend without in-place
+  replace, the app falls back to the old behaviour (new document, then
+  the previous one is deleted).
 - **finally** — persists the next cursor, only when nothing failed.
 
 ### Token custody
